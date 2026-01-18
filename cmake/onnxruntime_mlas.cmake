@@ -305,6 +305,9 @@ function(setup_kleidiai)
     target_compile_definitions(onnxruntime_mlas PRIVATE KLEIDIAI_KERNEL=1)
   endif()
 
+  target_compile_definitions(onnxruntime_mlas PRIVATE KLEIDIAI_MAX_LHS_PACK_BYTES=${onnxruntime_KLEIDIAI_MAX_LHS_PACK_BYTES})
+
+
   if (NOT onnxruntime_BUILD_SHARED_LIB)
     install(TARGETS kleidiai EXPORT ${PROJECT_NAME}Targets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}

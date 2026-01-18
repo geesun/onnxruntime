@@ -298,37 +298,6 @@ static std::unique_ptr<float[]> NChwToNhwc(const size_t n,
     return t;
 }
 
-static void MultiThreadedLHSPackSme(MLAS_THREADPOOL* ThreadPool, const size_t ci, const size_t m, const size_t kh,
-                                    const size_t kw, const void * const* lhs_ptrs, std::byte* lhs_data,
-                                    const float* in_data,
-                                    const float* pad_ptr) {
-    size_t m_step = ArmKleidiAI::UseSME2 ? kai_get_m_step_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme2_mopa()
-                                         : kai_get_m_step_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa();
-
-    // Minimize the kernel call count for the number of available threads
-    auto RequiredTiles = MlasDivRoundup(m, m_step);
-    auto MaxTiles = std::min(static_cast<size_t>(MlasGetMaximumThreadCount(ThreadPool)), RequiredTiles);
-    m_step *= MlasDivRoundup(RequiredTiles, MaxTiles);
-    RequiredTiles = MlasDivRoundup(m, m_step);
-
-    MlasTrySimpleParallel(ThreadPool, static_cast<ptrdiff_t>(RequiredTiles), [&](ptrdiff_t tid) {
-
-        auto m_idx = static_cast<size_t>(tid) * m_step;
-        auto offset = kai_get_lhs_packed_offset_lhs_imatmul_pack_x32p2vlx1_x32p_sme(m_idx,kh*kw,ci);
-
-        KLEIDIAI_KERNEL_LOG("kai_run_lhs_imatmul_pack_x32p2vlx1_x32p_sme"
-                            << " M=" << (m < (m_idx + m_step) ? m - m_idx : m_step)
-                            << " k_chunk_count=" << (kh * kw)
-                            << " k_chunk_length=" << ci);
-        kai_run_lhs_imatmul_pack_x32p2vlx1_x32p_sme(
-            m < (m_idx + m_step) ? m - m_idx : m_step, kh * kw, ci,
-            lhs_ptrs + m_idx * kh * kw,
-            reinterpret_cast<size_t>(in_data),
-            reinterpret_cast<const void*>(pad_ptr),
-            lhs_data + offset
-        );
-    });
-}
 
 static std::shared_ptr<std::byte[]> RhsPackWeightsBiasSme(const size_t co, const size_t ci,
                                                           const size_t kh, const size_t kw,
@@ -449,19 +418,11 @@ static std::shared_ptr<const void*[]> LhsPtrFill(const size_t ci, const size_t i
     return lhs_ptrs;
 }
 
-static std::unique_ptr<std::byte[]> LhsPackImageDataSme(const size_t ci, const size_t ih, const size_t iw,
-                                                        const size_t kh, const size_t kw, const size_t sh,
-                                                        const size_t sw, const size_t padding, const float* in,
-                                                        MLAS_THREADPOOL* ThreadPool)
-{
-    size_t padsize = 256;
-    if(ci > padsize)
-    {
-        // figure out how many blocks needed to correctly fill padding
-        padsize = ((ci + padsize - 1) / padsize) * padsize;
-    }
-    static std::vector<float>pad_ptr(padsize, 0.f);
 
+static std::shared_ptr<const void*[]>  GetOrCreateLhsPtrTableSme(const size_t ci, const size_t ih, const size_t iw,
+        const size_t kh, const size_t kw, const size_t sh,
+        const size_t sw, const size_t padding, const float* in,const float* pad_ptr)
+{
     LhsCacheKey key = {
         ci, ih, iw,
         padding, sh, sw,
@@ -470,14 +431,6 @@ static std::unique_ptr<std::byte[]> LhsPackImageDataSme(const size_t ci, const s
         HashWeights(in)
     };
 
-    //create lhs in format required for imatmul
-    const auto m = ComputeConvOutSize(ih, kh, padding, sh) * ComputeConvOutSize(iw, kw, padding, sw);
-
-    const auto lhs_size = kai_get_lhs_packed_size_lhs_imatmul_pack_x32p2vlx1_x32p_sme(m,kh*kw,ci);
-    auto lhs = std::make_unique<std::byte[]>(lhs_size);
-
-    auto nhwc = NChwToNhwc(1, ci, ih, iw, in, 1, 1, false, ThreadPool);
-
     // Cache of computed lhs ptr offsets.  thread_local to prevent interference from parallel sessions.
     thread_local std::unordered_map<LhsCacheKey, std::shared_ptr<const void*[]>> lhs_ptrs_cache;
 
@@ -485,14 +438,13 @@ static std::unique_ptr<std::byte[]> LhsPackImageDataSme(const size_t ci, const s
     if (auto found = lhs_ptrs_cache.find(key); found != lhs_ptrs_cache.end()) {
         lhs_ptrs = found->second;
     } else {
-        lhs_ptrs = LhsPtrFill(ci, ih, iw, kh, kw, sh, sw, padding, &pad_ptr[0]);
+        lhs_ptrs = LhsPtrFill(ci, ih, iw, kh, kw, sh, sw, padding, pad_ptr);
         lhs_ptrs_cache[key] = lhs_ptrs;
     }
 
-    MultiThreadedLHSPackSme(ThreadPool, ci, m, kh, kw, &lhs_ptrs[0], &lhs[0], &nhwc[0], &pad_ptr[0]);
-
-    return lhs;
+    return lhs_ptrs;
 }
+
 
 static void ConvolveSme(const size_t co, //channels out
                         const size_t ci,  //channels in
@@ -541,12 +493,22 @@ static void ConvolveSme(const size_t co, //channels out
     dim[2] = MlasDivRoundup(RequiredTiles * dim[2], dim[1] * dim[2]);
 
     //compute new step sizes
-    m_step *= MlasDivRoundup(MlasDivRoundup(m, dim[1]), m_step);
-    n_step *= MlasDivRoundup(MlasDivRoundup(co, dim[2]), n_step);
+    size_t M_step = m_step * MlasDivRoundup(MlasDivRoundup(m, dim[1]), m_step);
+    size_t N_step = n_step * MlasDivRoundup(MlasDivRoundup(co, dim[2]), n_step);
 
     //update tile iterations
-    dim[1] = MlasDivRoundup(m, m_step);
-    dim[2] = MlasDivRoundup(co, n_step);
+    dim[1] = MlasDivRoundup(m, M_step);
+    dim[2] = MlasDivRoundup(co, N_step);
+
+
+    size_t padsize = 256;
+    if(ci > padsize)
+    {
+        // figure out how many blocks needed to correctly fill padding
+        padsize = ((ci + padsize - 1) / padsize) * padsize;
+    }
+    static std::vector<float>pad_ptr(padsize, 0.f);
+
 
     for (size_t g = 0; g < groups; ++g) {
 
@@ -560,7 +522,9 @@ static void ConvolveSme(const size_t co, //channels out
             result = tmp_mlas_aligned;
         }
 
-        auto lhs = LhsPackImageDataSme(ci, ih, iw, d_kh, d_kw, sh, sw, padding, in, ThreadPool);
+        auto nhwc = NChwToNhwc(1, ci, ih, iw, in, 1, 1, false, ThreadPool);
+        auto lhs_ptrs = GetOrCreateLhsPtrTableSme(ci, ih, iw, d_kh, d_kw, sh, sw, padding, in,&pad_ptr[0]);
+
         auto rhs = RhsPackWeightsBiasSme(co, ci, kh, kw, dilationh, dilationw, weights, bias, ThreadPool);
 
         MlasTrySimpleParallel(ThreadPool, static_cast<ptrdiff_t>(dim[0] * dim[1] * dim[2]), [&](ptrdiff_t tid) {
@@ -570,60 +534,110 @@ static void ConvolveSme(const size_t co, //channels out
             ptrdiff_t NIdx = (tid % (dim[1] * dim[2])) % dim[2];
 
             // Get rhs tile, B
-            const size_t rhs_packed_offset = ArmKleidiAI::UseSME2 ? kai_get_rhs_packed_offset_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme2_mopa(NIdx * n_step, d_kh * d_kw, ci)
-                                                                  : kai_get_rhs_packed_offset_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa(NIdx * n_step, d_kh * d_kw, ci);
+            const size_t rhs_packed_offset = ArmKleidiAI::UseSME2 ? kai_get_rhs_packed_offset_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme2_mopa(NIdx * N_step, d_kh * d_kw, ci)
+                : kai_get_rhs_packed_offset_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa(NIdx * N_step, d_kh * d_kw, ci);
 
             auto BTile = reinterpret_cast<const void*>(
-                reinterpret_cast<const std::byte*>(rhs.get()) + rhs_packed_offset
-            );
+                    reinterpret_cast<const std::byte*>(rhs.get()) + rhs_packed_offset
+                    );
 
-            // Get lhs tile, A
-            const size_t lhs_packed_offset = ArmKleidiAI::UseSME2 ? kai_get_lhs_packed_offset_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme2_mopa(MIdx * m_step, d_kh * d_kw, ci)
-                                                                  : kai_get_lhs_packed_offset_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa(MIdx * m_step, d_kh * d_kw, ci);
+            auto TileSizeN = (NIdx + 1) * N_step > co ? (co - NIdx * N_step) : N_step;
 
+            //Compute the starting row index of the current M tile
+            size_t tile_m_start = MIdx * M_step;
+            //Actual number of rows in this tile (may be smaller for the last tile)
+            size_t tile_m_size  = std::min(M_step, m - tile_m_start);
+
+            // Upper bound on temporary LHS packed buffer size.
+            // We try to pack as many rows as possible without exceeding this limit.
+            constexpr size_t MAX_LHS_CHUNK_BYTES = KLEIDIAI_MAX_LHS_PACK_BYTES;
+
+            // Query the packed LHS buffer size for exactly one m_step block.
+            size_t bytes_per_m_step = kai_get_lhs_packed_size_lhs_imatmul_pack_x32p2vlx1_x32p_sme(
+                                m_step, d_kh * d_kw, ci);
+
+            // Determine how many rows we can pack in one chunk.
+            size_t m_chunk =
+                std::max<size_t>(
+                                m_step,
+                                MAX_LHS_CHUNK_BYTES / bytes_per_m_step * m_step);
+
+            // Do not exceed the number of rows available in this tile
+            m_chunk = std::min<size_t>(tile_m_size,m_chunk);
+
+            // Compute the exact packed buffer size for m_chunk rows.
+            const size_t lhs_buffer_bytes = kai_get_lhs_packed_size_lhs_imatmul_pack_x32p2vlx1_x32p_sme(
+                                m_chunk, d_kh * d_kw, ci);
+
+            // Allocate a single reusable buffer for LHS packing
+            auto lhs = std::make_unique<std::byte[]>(lhs_buffer_bytes);
+
+#if 0
+            std::cout << "bytes_per_m_step = " << bytes_per_m_step << std::endl;
+            std::cout << "m_chunk = " << m_chunk << std::endl;
+            std::cout << "m = " << m << std::endl;
+            std::cout << "m_step = " << m_step << std::endl;
+            std::cout << "M_step = " << M_step << std::endl;
+            std::cout << "lhs_buffer_bytes = " << lhs_buffer_bytes<< std::endl;
+#endif
+            // Interpret the packed LHS buffer as the input A tile
+            // for the matrix multiplication kernel.
             auto ATile = reinterpret_cast<const float*>(
-                reinterpret_cast<const std::byte*>(lhs.get()) + lhs_packed_offset
-            );
+                 reinterpret_cast<const std::byte*>(lhs.get()) );
 
-            auto TileSizeM = (MIdx + 1) * m_step > m ? (m - MIdx * m_step) : m_step;
-            auto TileSizeN = (NIdx + 1) * n_step > co ? (co - NIdx * n_step) : n_step;
+            for (size_t m_base = 0; m_base < tile_m_size; m_base += m_chunk) {
+                // Actual number of rows processed in this iteration.
+                // The last chunk may be smaller than m_chunk.
+                const size_t TileSizeM= std::min(m_chunk, tile_m_size - m_base);
 
-            // Get result tile, C
-            auto CTile = &reinterpret_cast<std::byte*>(result)[
-                MIdx * m_step * co * sizeof(float) +
-                NIdx * n_step * sizeof(float)];
+                // Pack TileSizeM rows of the LHS matrix into a temporary buffer.
+                kai_run_lhs_imatmul_pack_x32p2vlx1_x32p_sme(
+                        TileSizeM,
+                        d_kh * d_kw,
+                        ci,
+                        lhs_ptrs.get() + (MIdx * M_step + m_base) * d_kh * d_kw,
+                        reinterpret_cast<size_t>(nhwc.get()),
+                        reinterpret_cast<const void*>(&pad_ptr[0]),
+                        lhs.get()
+                        );
 
-            if (ArmKleidiAI::UseSME2) {
-                KLEIDIAI_KERNEL_LOG("kai_run_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme2_mopa" << " M=" << TileSizeM << " N=" << TileSizeN << " k_chunk_count=" << (d_kh * d_kw) << " k_chunk_length=" << ci);
-                kai_run_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme2_mopa(
-                    TileSizeM, TileSizeN, d_kh * d_kw, ci, ATile, BTile, CTile, co * sizeof(float),
-                    -std::numeric_limits<float>::max(), std::numeric_limits<float>::max()
-                );
-            } else {
-                        #if defined(ENABLE_QMX_KERNELS)
-                            if (ArmKleidiAI::vendor_name.compare("Qualcomm") == 0)
-                            {
-                                KLEIDIAI_KERNEL_LOG("kai_run_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_qmx_mopa" << " M=" << TileSizeM << " N=" << TileSizeN << " k_chunk_count=" << (d_kh * d_kw) << " k_chunk_length=" << ci);
-                                kai_run_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_qmx_mopa(
-                                    TileSizeM, TileSizeN, d_kh * d_kw, ci, ATile, BTile, CTile, co * sizeof(float),
-                                    -std::numeric_limits<float>::max(), std::numeric_limits<float>::max()
-                                );
-                            }
-                            else {
+                // Get result tile, C
+                auto CTile = &reinterpret_cast<std::byte*>(result)[
+                    (MIdx * M_step + m_base) * co * sizeof(float) +
+                    NIdx * N_step * sizeof(float)];
+
+                if (ArmKleidiAI::UseSME2) {
+                    KLEIDIAI_KERNEL_LOG("kai_run_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme2_mopa" << " M=" << TileSizeM << " N=" << TileSizeN << " k_chunk_count=" << (d_kh * d_kw) << " k_chunk_length=" << ci);
+                    kai_run_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme2_mopa(
+                        TileSizeM, TileSizeN, d_kh * d_kw, ci, ATile, BTile, CTile, co * sizeof(float),
+                        -std::numeric_limits<float>::max(), std::numeric_limits<float>::max()
+                    );
+                } else {
+                            #if defined(ENABLE_QMX_KERNELS)
+                                if (ArmKleidiAI::vendor_name.compare("Qualcomm") == 0)
+                                {
+                                    KLEIDIAI_KERNEL_LOG("kai_run_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_qmx_mopa" << " M=" << TileSizeM << " N=" << TileSizeN << " k_chunk_count=" << (d_kh * d_kw) << " k_chunk_length=" << ci);
+                                    kai_run_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_qmx_mopa(
+                                        TileSizeM, TileSizeN, d_kh * d_kw, ci, ATile, BTile, CTile, co * sizeof(float),
+                                        -std::numeric_limits<float>::max(), std::numeric_limits<float>::max()
+                                    );
+                                }
+                                else {
+                                    KLEIDIAI_KERNEL_LOG("kai_run_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa" << " M=" << TileSizeM << " N=" << TileSizeN << " k_chunk_count=" << (d_kh * d_kw) << " k_chunk_length=" << ci);
+                                    kai_run_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa(
+                                        TileSizeM, TileSizeN, d_kh * d_kw, ci, ATile, BTile, CTile, co * sizeof(float),
+                                        -std::numeric_limits<float>::max(), std::numeric_limits<float>::max()
+                                    );
+                                }
+                            #else
                                 KLEIDIAI_KERNEL_LOG("kai_run_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa" << " M=" << TileSizeM << " N=" << TileSizeN << " k_chunk_count=" << (d_kh * d_kw) << " k_chunk_length=" << ci);
                                 kai_run_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa(
                                     TileSizeM, TileSizeN, d_kh * d_kw, ci, ATile, BTile, CTile, co * sizeof(float),
                                     -std::numeric_limits<float>::max(), std::numeric_limits<float>::max()
                                 );
-                            }
-                        #else
-                            KLEIDIAI_KERNEL_LOG("kai_run_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa" << " M=" << TileSizeM << " N=" << TileSizeN << " k_chunk_count=" << (d_kh * d_kw) << " k_chunk_length=" << ci);
-                            kai_run_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa(
-                                TileSizeM, TileSizeN, d_kh * d_kw, ci, ATile, BTile, CTile, co * sizeof(float),
-                                -std::numeric_limits<float>::max(), std::numeric_limits<float>::max()
-                            );
-                        #endif // ENABLE_QMX_KERNELS
-            }
+                            #endif // ENABLE_QMX_KERNELS
+                }
+	    }
         });
 
         if (result == tmp_mlas_aligned) {
