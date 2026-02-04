@@ -16,10 +16,17 @@
 #include "kai/ukernels/matmul/imatmul_clamp_f32_f32p_f32p/kai_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme2_mopa.h"
 #include "kai/ukernels/matmul/pack/kai_lhs_imatmul_pack_x32p2vlx1_x32p_sme.h"
 #include "kai/ukernels/matmul/pack/kai_rhs_imatmul_pack_kxn_x32p2vlx1b_x32_x32_sme.h"
+
+#include "kai/ukernels/matmul/imatmul_clamp_f32_f32p_f32p/kai_imatmul_clamp_f32_f32p1vlx1_f32p1vlx1b_1vlx1vl_sme_mopa.h"
+#include "kai/ukernels/matmul/imatmul_clamp_f32_f32p_f32p/kai_imatmul_clamp_f32_f32p1vlx1_f32p1vlx1b_1vlx1vl_sme2_mopa.h"
+#include "kai/ukernels/matmul/pack/kai_lhs_imatmul_pack_x32p1vlx1_x32p_sme.h"
+#include "kai/ukernels/matmul/pack/kai_rhs_imatmul_pack_kxn_x32p1vlx1b_x32_x32_sme.h"
+
 #if defined(ENABLE_QMX_KERNELS)
 #include "kai/ukernels/matmul/imatmul_clamp_f32_f32p_f32p/kai_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_qmx_mopa.h"
 #endif // ENABLE_QMX_KERNELS
 
+bool use_1vl_kai = false;
 
 // Right-hand-side (weights) cache key
 struct RhsCacheKey {
@@ -326,7 +333,12 @@ static std::shared_ptr<std::byte[]> RhsPackWeightsBiasSme(const size_t co, const
         //t_weights[d_kh][d_kw][ci][co] = nhwc[co][d_kh][d_kw][ci]
         auto t_weights = Transpose4D({co,d_kh,d_kw,ci},&nhwc[0],{1,2,3,0});
 
-        const auto packed_size = kai_get_rhs_packed_size_rhs_imatmul_pack_kxn_x32p2vlx1b_x32_x32_sme(co,d_kh*d_kw,ci);
+        size_t packed_size = 0;
+	    if (use_1vl_kai){
+        packed_size = kai_get_rhs_packed_size_rhs_imatmul_pack_kxn_x32p1vlx1b_x32_x32_sme(co,d_kh*d_kw,ci);
+	    }else{
+        packed_size = kai_get_rhs_packed_size_rhs_imatmul_pack_kxn_x32p2vlx1b_x32_x32_sme(co,d_kh*d_kw,ci);
+	    }
         auto packed = std::shared_ptr<std::byte[]>(new std::byte[packed_size], std::default_delete<std::byte[]>());
 
         rhs_cache[key] = packed;
@@ -340,9 +352,15 @@ static std::shared_ptr<std::byte[]> RhsPackWeightsBiasSme(const size_t co, const
 
         KLEIDIAI_KERNEL_LOG("kai_run_rhs_imatmul_pack_kxn_x32p2vlx1b_x32_x32_sme"
                             << " N=" << co << " k_chunk_count=" << (d_kh*d_kw) << " k_chunk_length=" << ci << " rhs_stride_row=" << (co * sizeof(float)));
+	    if (use_1vl_kai){
+        kai_run_rhs_imatmul_pack_kxn_x32p1vlx1b_x32_x32_sme(
+            co, d_kh*d_kw, ci, co * sizeof(float), &t_weights[0], bias_copy.data(), packed.get()
+        );
+	    }else {
         kai_run_rhs_imatmul_pack_kxn_x32p2vlx1b_x32_x32_sme(
             co, d_kh*d_kw, ci, co * sizeof(float), &t_weights[0], bias_copy.data(), packed.get()
         );
+	    }
 
         return packed;
     }
@@ -356,8 +374,13 @@ static std::shared_ptr<const void*[]> LhsPtrFill(const size_t ci, const size_t i
 
     const auto m = ComputeConvOutSize(ih, kh, padding, sh) * ComputeConvOutSize(iw, kw, padding, sw);
 
-    const auto m_step = ArmKleidiAI::UseSME2 ? kai_get_m_step_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme2_mopa()
+    auto m_step = ArmKleidiAI::UseSME2 ? kai_get_m_step_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme2_mopa()
                                              : kai_get_m_step_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa();
+	    if (use_1vl_kai){
+    m_step = ArmKleidiAI::UseSME2 ? kai_get_m_step_imatmul_clamp_f32_f32p1vlx1_f32p1vlx1b_1vlx1vl_sme2_mopa()
+                                             : kai_get_m_step_imatmul_clamp_f32_f32p1vlx1_f32p1vlx1b_1vlx1vl_sme_mopa();
+	    }
+		    
 
     const auto lhs_ptrs_k = kh * kw;
     const auto lhs_ptrs_m = m_step * MlasDivRoundup(m, m_step);
@@ -479,6 +502,14 @@ static void ConvolveSme(const size_t co, //channels out
     size_t m_step = ArmKleidiAI::UseSME2 ? kai_get_m_step_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme2_mopa()
                                          : kai_get_m_step_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa();
 
+    if (m < m_step || co < n_step){
+	//std::cout << "m = " << m << " m_step = " << m_step << " co = " << co << "n_step = " << n_step << std::endl;
+    	use_1vl_kai = true;
+    	n_step = ArmKleidiAI::UseSME2 ? kai_get_n_step_imatmul_clamp_f32_f32p1vlx1_f32p1vlx1b_1vlx1vl_sme2_mopa()
+                                         : kai_get_n_step_imatmul_clamp_f32_f32p1vlx1_f32p1vlx1b_1vlx1vl_sme_mopa();
+    	m_step = ArmKleidiAI::UseSME2 ? kai_get_m_step_imatmul_clamp_f32_f32p1vlx1_f32p1vlx1b_1vlx1vl_sme2_mopa()
+                                         : kai_get_m_step_imatmul_clamp_f32_f32p1vlx1_f32p1vlx1b_1vlx1vl_sme_mopa();
+    }
     // tile iteration dimensions
     std::array<size_t,3> dim;
     dim[0] = 1;                          // B
@@ -532,10 +563,19 @@ static void ConvolveSme(const size_t co, //channels out
             //ptrdiff_t BIdx = tid / (dim[1] * dim[2]);
             ptrdiff_t MIdx = (tid % (dim[1] * dim[2])) / dim[2];
             ptrdiff_t NIdx = (tid % (dim[1] * dim[2])) % dim[2];
-
+	    
+	    size_t rhs_packed_offset = 0; 
+		
+	    if (use_1vl_kai){
+            rhs_packed_offset = ArmKleidiAI::UseSME2 ? kai_get_rhs_packed_offset_imatmul_clamp_f32_f32p1vlx1_f32p1vlx1b_1vlx1vl_sme2_mopa(NIdx * N_step, d_kh * d_kw, ci)
+                : kai_get_rhs_packed_offset_imatmul_clamp_f32_f32p1vlx1_f32p1vlx1b_1vlx1vl_sme_mopa(NIdx * N_step, d_kh * d_kw, ci);
+	    }else {
             // Get rhs tile, B
-            const size_t rhs_packed_offset = ArmKleidiAI::UseSME2 ? kai_get_rhs_packed_offset_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme2_mopa(NIdx * N_step, d_kh * d_kw, ci)
+            rhs_packed_offset = ArmKleidiAI::UseSME2 ? kai_get_rhs_packed_offset_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme2_mopa(NIdx * N_step, d_kh * d_kw, ci)
                 : kai_get_rhs_packed_offset_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa(NIdx * N_step, d_kh * d_kw, ci);
+		
+	    }
+
 
             auto BTile = reinterpret_cast<const void*>(
                     reinterpret_cast<const std::byte*>(rhs.get()) + rhs_packed_offset
@@ -552,9 +592,16 @@ static void ConvolveSme(const size_t co, //channels out
             // We try to pack as many rows as possible without exceeding this limit.
             constexpr size_t MAX_LHS_CHUNK_BYTES = KLEIDIAI_MAX_LHS_PACK_BYTES;
 
+
+            size_t bytes_per_m_step =  0;
+	    if (use_1vl_kai){
             // Query the packed LHS buffer size for exactly one m_step block.
-            size_t bytes_per_m_step = kai_get_lhs_packed_size_lhs_imatmul_pack_x32p2vlx1_x32p_sme(
+            bytes_per_m_step = kai_get_lhs_packed_size_lhs_imatmul_pack_x32p1vlx1_x32p_sme(
                                 m_step, d_kh * d_kw, ci);
+	    }else {
+            bytes_per_m_step = kai_get_lhs_packed_size_lhs_imatmul_pack_x32p2vlx1_x32p_sme(
+                                m_step, d_kh * d_kw, ci);
+	    }
 
             // Determine how many rows we can pack in one chunk.
             size_t m_chunk =
@@ -565,9 +612,16 @@ static void ConvolveSme(const size_t co, //channels out
             // Do not exceed the number of rows available in this tile
             m_chunk = std::min<size_t>(tile_m_size,m_chunk);
 
+            size_t lhs_buffer_bytes = 0;
+	    if (use_1vl_kai){
             // Compute the exact packed buffer size for m_chunk rows.
-            const size_t lhs_buffer_bytes = kai_get_lhs_packed_size_lhs_imatmul_pack_x32p2vlx1_x32p_sme(
+            lhs_buffer_bytes = kai_get_lhs_packed_size_lhs_imatmul_pack_x32p1vlx1_x32p_sme(
                                 m_chunk, d_kh * d_kw, ci);
+	    }else{
+            lhs_buffer_bytes = kai_get_lhs_packed_size_lhs_imatmul_pack_x32p2vlx1_x32p_sme(
+                                m_chunk, d_kh * d_kw, ci);
+	    }
+
 
             // Allocate a single reusable buffer for LHS packing
             auto lhs = std::make_unique<std::byte[]>(lhs_buffer_bytes);
@@ -590,8 +644,9 @@ static void ConvolveSme(const size_t co, //channels out
                 // The last chunk may be smaller than m_chunk.
                 const size_t TileSizeM= std::min(m_chunk, tile_m_size - m_base);
 
+	    if (use_1vl_kai){
                 // Pack TileSizeM rows of the LHS matrix into a temporary buffer.
-                kai_run_lhs_imatmul_pack_x32p2vlx1_x32p_sme(
+                kai_run_lhs_imatmul_pack_x32p1vlx1_x32p_sme(
                         TileSizeM,
                         d_kh * d_kw,
                         ci,
@@ -600,6 +655,18 @@ static void ConvolveSme(const size_t co, //channels out
                         reinterpret_cast<const void*>(&pad_ptr[0]),
                         lhs.get()
                         );
+	    }else{
+                kai_run_lhs_imatmul_pack_x32p2vlx1_x32p_sme(
+                        TileSizeM,
+                        d_kh * d_kw,
+                        ci,
+                        lhs_ptrs.get() + (MIdx * M_step + m_base) * d_kh * d_kw,
+                        reinterpret_cast<size_t>(nhwc.get()),
+                        reinterpret_cast<const void*>(&pad_ptr[0]),
+                        lhs.get()
+			);
+	    
+	    }
 
                 // Get result tile, C
                 auto CTile = &reinterpret_cast<std::byte*>(result)[
@@ -608,10 +675,17 @@ static void ConvolveSme(const size_t co, //channels out
 
                 if (ArmKleidiAI::UseSME2) {
                     KLEIDIAI_KERNEL_LOG("kai_run_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme2_mopa" << " M=" << TileSizeM << " N=" << TileSizeN << " k_chunk_count=" << (d_kh * d_kw) << " k_chunk_length=" << ci);
+	    if (use_1vl_kai){
+                    kai_run_imatmul_clamp_f32_f32p1vlx1_f32p1vlx1b_1vlx1vl_sme2_mopa(
+                        TileSizeM, TileSizeN, d_kh * d_kw, ci, ATile, BTile, CTile, co * sizeof(float),
+                        -std::numeric_limits<float>::max(), std::numeric_limits<float>::max()
+                    );
+	    }else{
                     kai_run_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme2_mopa(
                         TileSizeM, TileSizeN, d_kh * d_kw, ci, ATile, BTile, CTile, co * sizeof(float),
                         -std::numeric_limits<float>::max(), std::numeric_limits<float>::max()
                     );
+	    }
                 } else {
                             #if defined(ENABLE_QMX_KERNELS)
                                 if (ArmKleidiAI::vendor_name.compare("Qualcomm") == 0)
@@ -631,10 +705,17 @@ static void ConvolveSme(const size_t co, //channels out
                                 }
                             #else
                                 KLEIDIAI_KERNEL_LOG("kai_run_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa" << " M=" << TileSizeM << " N=" << TileSizeN << " k_chunk_count=" << (d_kh * d_kw) << " k_chunk_length=" << ci);
+	    if (use_1vl_kai){
+                                kai_run_imatmul_clamp_f32_f32p1vlx1_f32p1vlx1b_1vlx1vl_sme_mopa(
+                                    TileSizeM, TileSizeN, d_kh * d_kw, ci, ATile, BTile, CTile, co * sizeof(float),
+                                    -std::numeric_limits<float>::max(), std::numeric_limits<float>::max()
+                                );
+	    }else {
                                 kai_run_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa(
                                     TileSizeM, TileSizeN, d_kh * d_kw, ci, ATile, BTile, CTile, co * sizeof(float),
                                     -std::numeric_limits<float>::max(), std::numeric_limits<float>::max()
                                 );
+	    }
                             #endif // ENABLE_QMX_KERNELS
                 }
 	    }
