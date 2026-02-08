@@ -26,18 +26,30 @@
 #include "kai/ukernels/matmul/imatmul_clamp_f32_f32p_f32p/kai_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_qmx_mopa.h"
 #endif // ENABLE_QMX_KERNELS
 
-bool use_1vl_kai = false;
+// Function pointer structure for KAI kernels
+struct KaiKernelFunctions {
+    size_t (*get_m_step)();
+    size_t (*get_n_step)();
+    size_t (*get_rhs_packed_size)(size_t, size_t, size_t);
+    void (*run_rhs_pack)(size_t, size_t, size_t, size_t, const void*, const void*, void*);
+    size_t (*get_rhs_packed_offset)(size_t, size_t, size_t);
+    size_t (*get_lhs_packed_size)(size_t, size_t, size_t);
+    void (*run_lhs_pack)(size_t, size_t, size_t, const void* const*, size_t, const void*, void*);
+    void (*run_matmul)(size_t, size_t, size_t, size_t, const void*, const void*, void*, size_t, float, float);
+};
 
 // Right-hand-side (weights) cache key
 struct RhsCacheKey {
     size_t co, ci, kh, kw, dilationh, dilationw;
     size_t weights_hash;
+    const void* kai_funcs_ptr;  // Add kai_funcs pointer to distinguish different packing formats
 
     bool operator==(const RhsCacheKey& other) const {
         return co == other.co && ci == other.ci &&
                kh == other.kh && kw == other.kw &&
                dilationh == other.dilationh && dilationw == other.dilationw &&
-               weights_hash == other.weights_hash;
+               weights_hash == other.weights_hash &&
+               kai_funcs_ptr == other.kai_funcs_ptr;
     }
 };
 
@@ -85,7 +97,8 @@ namespace std {
                 (std::hash<size_t>()(k.kh) << 3) ^
                 (std::hash<size_t>()(k.kw) << 4) ^
                 (std::hash<size_t>()(k.dilationh) << 5) ^
-                (std::hash<size_t>()(k.dilationw) << 6);
+                (std::hash<size_t>()(k.dilationw) << 6) ^
+                (std::hash<size_t>()(reinterpret_cast<size_t>(k.kai_funcs_ptr)) << 7);
         }
     };
 
@@ -179,6 +192,49 @@ static bool CheckCapabilitiesSme(const MLAS_CONV_PARAMETERS* Parameters) {
         return false;
     }
     return true;
+}
+
+static bool CheckKleidiAIPerformance(size_t M, size_t N, size_t K, size_t m_step, size_t n_step) {
+    // Calculate tile counts
+    size_t m_tiles = (M + 16 - 1) / 16;  // ⌈M/m_step⌉
+    size_t n_tiles = (N + 16 - 1) / 16;  // ⌈N/n_step⌉
+    size_t k_tiles = (K + 16 - 1) / 16;  // ⌈K/m_step⌉
+
+    // FMOPA count
+    size_t fmopa_count = m_tiles * n_tiles * K;
+
+    // Pack load counts
+    size_t left_pack_loads = K * m_tiles;   // Left matrix pack: K columns × m_tiles
+    size_t right_pack_loads = K * n_tiles;  // Right matrix pack: K rows × n_tiles
+    size_t total_pack_loads = left_pack_loads + right_pack_loads;
+
+    // Pk/Fmopa ratio
+    float pk_fmopa_ratio = fmopa_count > 0 ? (float)total_pack_loads / (float)fmopa_count : 0.0f;
+
+    // Left matrix reuse count
+    size_t left_reuse = n_tiles * k_tiles;
+
+    // Arithmetic Intensity
+    size_t flops = 2 * M * N * K;  // Matrix multiplication: 2MNK floating point operations
+    size_t data_bytes = (M * K + K * N) * sizeof(float);  // Input data size in bytes
+    float ai = data_bytes > 0 ? (float)flops / (float)data_bytes : 0.0f;
+/*
+    std::cout << "Performance Check: M:" << M << " K:" << K << " N=" << N
+              << " m_step=" << m_step << " n_step=" << n_step
+              << " fmopa_count=" << fmopa_count
+              << " total_pack_loads=" << total_pack_loads
+              << " pk/fmopa_ratio=" << pk_fmopa_ratio
+              << " left_reuse=" << left_reuse
+              << " arithmetic_intensity=" << ai
+              << std::endl;
+*/
+    // Performance check: reject if poor performance expected
+    if (pk_fmopa_ratio < 0.25 && left_reuse >128 && ai > 40) {
+        return true;
+    }
+    return false;
+
+
 }
 
 //General purpose axis swapping
@@ -310,12 +366,13 @@ static std::shared_ptr<std::byte[]> RhsPackWeightsBiasSme(const size_t co, const
                                                           const size_t kh, const size_t kw,
                                                           const size_t dilationh, const size_t dilationw,
                                                           const float* weights, const float* bias,
+                                                          const KaiKernelFunctions* kai_funcs,
                                                           MLAS_THREADPOOL* ThreadPool)
 {
     // Cache of prepacked kai rhs weights and biases. thread_local to prevent interference from parallel sessions.
     thread_local std::unordered_map<RhsCacheKey, std::shared_ptr<std::byte[]>> rhs_cache;
 
-    RhsCacheKey key = { co, ci, kh, kw, dilationh, dilationw, HashWeights(weights) };
+    RhsCacheKey key = { co, ci, kh, kw, dilationh, dilationw, HashWeights(weights), kai_funcs };
 
     auto found = rhs_cache.find(key);
     if (found != rhs_cache.end()) {
@@ -333,12 +390,7 @@ static std::shared_ptr<std::byte[]> RhsPackWeightsBiasSme(const size_t co, const
         //t_weights[d_kh][d_kw][ci][co] = nhwc[co][d_kh][d_kw][ci]
         auto t_weights = Transpose4D({co,d_kh,d_kw,ci},&nhwc[0],{1,2,3,0});
 
-        size_t packed_size = 0;
-	    if (use_1vl_kai){
-        packed_size = kai_get_rhs_packed_size_rhs_imatmul_pack_kxn_x32p1vlx1b_x32_x32_sme(co,d_kh*d_kw,ci);
-	    }else{
-        packed_size = kai_get_rhs_packed_size_rhs_imatmul_pack_kxn_x32p2vlx1b_x32_x32_sme(co,d_kh*d_kw,ci);
-	    }
+        size_t packed_size = kai_funcs->get_rhs_packed_size(co, d_kh*d_kw, ci);
         auto packed = std::shared_ptr<std::byte[]>(new std::byte[packed_size], std::default_delete<std::byte[]>());
 
         rhs_cache[key] = packed;
@@ -350,17 +402,14 @@ static std::shared_ptr<std::byte[]> RhsPackWeightsBiasSme(const size_t co, const
             bias_copy.resize(co, 0.0f);
         }
 
-        KLEIDIAI_KERNEL_LOG("kai_run_rhs_imatmul_pack_kxn_x32p2vlx1b_x32_x32_sme"
+        KLEIDIAI_KERNEL_LOG("kai_run_rhs_imatmul_pack"
                             << " N=" << co << " k_chunk_count=" << (d_kh*d_kw) << " k_chunk_length=" << ci << " rhs_stride_row=" << (co * sizeof(float)));
-	    if (use_1vl_kai){
-        kai_run_rhs_imatmul_pack_kxn_x32p1vlx1b_x32_x32_sme(
-            co, d_kh*d_kw, ci, co * sizeof(float), &t_weights[0], bias_copy.data(), packed.get()
+        kai_funcs->run_rhs_pack(
+            co, d_kh*d_kw, ci, co * sizeof(float),
+            reinterpret_cast<const void*>(&t_weights[0]),
+            reinterpret_cast<const void*>(bias_copy.data()),
+            packed.get()
         );
-	    }else {
-        kai_run_rhs_imatmul_pack_kxn_x32p2vlx1b_x32_x32_sme(
-            co, d_kh*d_kw, ci, co * sizeof(float), &t_weights[0], bias_copy.data(), packed.get()
-        );
-	    }
 
         return packed;
     }
@@ -369,18 +418,13 @@ static std::shared_ptr<std::byte[]> RhsPackWeightsBiasSme(const size_t co, const
 static std::shared_ptr<const void*[]> LhsPtrFill(const size_t ci, const size_t ih, const size_t iw,
                                                  const size_t kh, const size_t kw, size_t sh, size_t sw,
                                                  const size_t padding,
-                                                 const float* pad_ptr) {
+                                                 const float* pad_ptr,
+                                                 const KaiKernelFunctions* kai_funcs) {
     size_t check_filled{0};
 
     const auto m = ComputeConvOutSize(ih, kh, padding, sh) * ComputeConvOutSize(iw, kw, padding, sw);
 
-    auto m_step = ArmKleidiAI::UseSME2 ? kai_get_m_step_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme2_mopa()
-                                             : kai_get_m_step_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa();
-	    if (use_1vl_kai){
-    m_step = ArmKleidiAI::UseSME2 ? kai_get_m_step_imatmul_clamp_f32_f32p1vlx1_f32p1vlx1b_1vlx1vl_sme2_mopa()
-                                             : kai_get_m_step_imatmul_clamp_f32_f32p1vlx1_f32p1vlx1b_1vlx1vl_sme_mopa();
-	    }
-		    
+    auto m_step = kai_funcs->get_m_step();
 
     const auto lhs_ptrs_k = kh * kw;
     const auto lhs_ptrs_m = m_step * MlasDivRoundup(m, m_step);
@@ -444,7 +488,8 @@ static std::shared_ptr<const void*[]> LhsPtrFill(const size_t ci, const size_t i
 
 static std::shared_ptr<const void*[]>  GetOrCreateLhsPtrTableSme(const size_t ci, const size_t ih, const size_t iw,
         const size_t kh, const size_t kw, const size_t sh,
-        const size_t sw, const size_t padding, const float* in,const float* pad_ptr)
+        const size_t sw, const size_t padding, const float* in,const float* pad_ptr,
+        const KaiKernelFunctions* kai_funcs)
 {
     LhsCacheKey key = {
         ci, ih, iw,
@@ -461,7 +506,7 @@ static std::shared_ptr<const void*[]>  GetOrCreateLhsPtrTableSme(const size_t ci
     if (auto found = lhs_ptrs_cache.find(key); found != lhs_ptrs_cache.end()) {
         lhs_ptrs = found->second;
     } else {
-        lhs_ptrs = LhsPtrFill(ci, ih, iw, kh, kw, sh, sw, padding, pad_ptr);
+        lhs_ptrs = LhsPtrFill(ci, ih, iw, kh, kw, sh, sw, padding, pad_ptr, kai_funcs);
         lhs_ptrs_cache[key] = lhs_ptrs;
     }
 
@@ -486,6 +531,7 @@ static void ConvolveSme(const size_t co, //channels out
                         const float* in,           //in image data
                         float* out,                //out image data
                         float* tmp_mlas_aligned,   //intermediate buffer if we need to perform a transpose
+                        const KaiKernelFunctions* kai_funcs,
                         MLAS_THREADPOOL* ThreadPool) {
 
     //RhsPackWeightsBiasSme() - to perform dilation increases kernel size and masks unused weights
@@ -497,19 +543,8 @@ static void ConvolveSme(const size_t co, //channels out
     const auto m = ComputeConvOutSize(ih, d_kh, padding, sh) *
                    ComputeConvOutSize(iw, d_kw, padding, sw);
 
-    size_t n_step = ArmKleidiAI::UseSME2 ? kai_get_n_step_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme2_mopa()
-                                         : kai_get_n_step_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa();
-    size_t m_step = ArmKleidiAI::UseSME2 ? kai_get_m_step_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme2_mopa()
-                                         : kai_get_m_step_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa();
-
-    if (m < m_step || co < n_step){
-	//std::cout << "m = " << m << " m_step = " << m_step << " co = " << co << "n_step = " << n_step << std::endl;
-    	use_1vl_kai = true;
-    	n_step = ArmKleidiAI::UseSME2 ? kai_get_n_step_imatmul_clamp_f32_f32p1vlx1_f32p1vlx1b_1vlx1vl_sme2_mopa()
-                                         : kai_get_n_step_imatmul_clamp_f32_f32p1vlx1_f32p1vlx1b_1vlx1vl_sme_mopa();
-    	m_step = ArmKleidiAI::UseSME2 ? kai_get_m_step_imatmul_clamp_f32_f32p1vlx1_f32p1vlx1b_1vlx1vl_sme2_mopa()
-                                         : kai_get_m_step_imatmul_clamp_f32_f32p1vlx1_f32p1vlx1b_1vlx1vl_sme_mopa();
-    }
+    size_t n_step = kai_funcs->get_n_step();
+    size_t m_step = kai_funcs->get_m_step();
     // tile iteration dimensions
     std::array<size_t,3> dim;
     dim[0] = 1;                          // B
@@ -554,27 +589,18 @@ static void ConvolveSme(const size_t co, //channels out
         }
 
         auto nhwc = NChwToNhwc(1, ci, ih, iw, in, 1, 1, false, ThreadPool);
-        auto lhs_ptrs = GetOrCreateLhsPtrTableSme(ci, ih, iw, d_kh, d_kw, sh, sw, padding, in,&pad_ptr[0]);
+        auto lhs_ptrs = GetOrCreateLhsPtrTableSme(ci, ih, iw, d_kh, d_kw, sh, sw, padding, in,&pad_ptr[0], kai_funcs);
 
-        auto rhs = RhsPackWeightsBiasSme(co, ci, kh, kw, dilationh, dilationw, weights, bias, ThreadPool);
+        auto rhs = RhsPackWeightsBiasSme(co, ci, kh, kw, dilationh, dilationw, weights, bias, kai_funcs, ThreadPool);
 
         MlasTrySimpleParallel(ThreadPool, static_cast<ptrdiff_t>(dim[0] * dim[1] * dim[2]), [&](ptrdiff_t tid) {
             //compute B,M,N index from iteration index
             //ptrdiff_t BIdx = tid / (dim[1] * dim[2]);
             ptrdiff_t MIdx = (tid % (dim[1] * dim[2])) / dim[2];
             ptrdiff_t NIdx = (tid % (dim[1] * dim[2])) % dim[2];
-	    
-	    size_t rhs_packed_offset = 0; 
-		
-	    if (use_1vl_kai){
-            rhs_packed_offset = ArmKleidiAI::UseSME2 ? kai_get_rhs_packed_offset_imatmul_clamp_f32_f32p1vlx1_f32p1vlx1b_1vlx1vl_sme2_mopa(NIdx * N_step, d_kh * d_kw, ci)
-                : kai_get_rhs_packed_offset_imatmul_clamp_f32_f32p1vlx1_f32p1vlx1b_1vlx1vl_sme_mopa(NIdx * N_step, d_kh * d_kw, ci);
-	    }else {
+
             // Get rhs tile, B
-            rhs_packed_offset = ArmKleidiAI::UseSME2 ? kai_get_rhs_packed_offset_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme2_mopa(NIdx * N_step, d_kh * d_kw, ci)
-                : kai_get_rhs_packed_offset_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa(NIdx * N_step, d_kh * d_kw, ci);
-		
-	    }
+            size_t rhs_packed_offset = kai_funcs->get_rhs_packed_offset(NIdx * N_step, d_kh * d_kw, ci);
 
 
             auto BTile = reinterpret_cast<const void*>(
@@ -592,16 +618,8 @@ static void ConvolveSme(const size_t co, //channels out
             // We try to pack as many rows as possible without exceeding this limit.
             constexpr size_t MAX_LHS_CHUNK_BYTES = KLEIDIAI_MAX_LHS_PACK_BYTES;
 
-
-            size_t bytes_per_m_step =  0;
-	    if (use_1vl_kai){
             // Query the packed LHS buffer size for exactly one m_step block.
-            bytes_per_m_step = kai_get_lhs_packed_size_lhs_imatmul_pack_x32p1vlx1_x32p_sme(
-                                m_step, d_kh * d_kw, ci);
-	    }else {
-            bytes_per_m_step = kai_get_lhs_packed_size_lhs_imatmul_pack_x32p2vlx1_x32p_sme(
-                                m_step, d_kh * d_kw, ci);
-	    }
+            size_t bytes_per_m_step = kai_funcs->get_lhs_packed_size(m_step, d_kh * d_kw, ci);
 
             // Determine how many rows we can pack in one chunk.
             size_t m_chunk =
@@ -612,15 +630,8 @@ static void ConvolveSme(const size_t co, //channels out
             // Do not exceed the number of rows available in this tile
             m_chunk = std::min<size_t>(tile_m_size,m_chunk);
 
-            size_t lhs_buffer_bytes = 0;
-	    if (use_1vl_kai){
             // Compute the exact packed buffer size for m_chunk rows.
-            lhs_buffer_bytes = kai_get_lhs_packed_size_lhs_imatmul_pack_x32p1vlx1_x32p_sme(
-                                m_chunk, d_kh * d_kw, ci);
-	    }else{
-            lhs_buffer_bytes = kai_get_lhs_packed_size_lhs_imatmul_pack_x32p2vlx1_x32p_sme(
-                                m_chunk, d_kh * d_kw, ci);
-	    }
+            size_t lhs_buffer_bytes = kai_funcs->get_lhs_packed_size(m_chunk, d_kh * d_kw, ci);
 
 
             // Allocate a single reusable buffer for LHS packing
@@ -644,9 +655,8 @@ static void ConvolveSme(const size_t co, //channels out
                 // The last chunk may be smaller than m_chunk.
                 const size_t TileSizeM= std::min(m_chunk, tile_m_size - m_base);
 
-	    if (use_1vl_kai){
                 // Pack TileSizeM rows of the LHS matrix into a temporary buffer.
-                kai_run_lhs_imatmul_pack_x32p1vlx1_x32p_sme(
+                kai_funcs->run_lhs_pack(
                         TileSizeM,
                         d_kh * d_kw,
                         ci,
@@ -654,70 +664,22 @@ static void ConvolveSme(const size_t co, //channels out
                         reinterpret_cast<size_t>(nhwc.get()),
                         reinterpret_cast<const void*>(&pad_ptr[0]),
                         lhs.get()
-                        );
-	    }else{
-                kai_run_lhs_imatmul_pack_x32p2vlx1_x32p_sme(
-                        TileSizeM,
-                        d_kh * d_kw,
-                        ci,
-                        lhs_ptrs.get() + (MIdx * M_step + m_base) * d_kh * d_kw,
-                        reinterpret_cast<size_t>(nhwc.get()),
-                        reinterpret_cast<const void*>(&pad_ptr[0]),
-                        lhs.get()
-			);
-	    
-	    }
+                );
 
                 // Get result tile, C
                 auto CTile = &reinterpret_cast<std::byte*>(result)[
                     (MIdx * M_step + m_base) * co * sizeof(float) +
                     NIdx * N_step * sizeof(float)];
 
-                if (ArmKleidiAI::UseSME2) {
-                    KLEIDIAI_KERNEL_LOG("kai_run_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme2_mopa" << " M=" << TileSizeM << " N=" << TileSizeN << " k_chunk_count=" << (d_kh * d_kw) << " k_chunk_length=" << ci);
-	    if (use_1vl_kai){
-                    kai_run_imatmul_clamp_f32_f32p1vlx1_f32p1vlx1b_1vlx1vl_sme2_mopa(
-                        TileSizeM, TileSizeN, d_kh * d_kw, ci, ATile, BTile, CTile, co * sizeof(float),
-                        -std::numeric_limits<float>::max(), std::numeric_limits<float>::max()
-                    );
-	    }else{
-                    kai_run_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme2_mopa(
-                        TileSizeM, TileSizeN, d_kh * d_kw, ci, ATile, BTile, CTile, co * sizeof(float),
-                        -std::numeric_limits<float>::max(), std::numeric_limits<float>::max()
-                    );
-	    }
-                } else {
-                            #if defined(ENABLE_QMX_KERNELS)
-                                if (ArmKleidiAI::vendor_name.compare("Qualcomm") == 0)
-                                {
-                                    KLEIDIAI_KERNEL_LOG("kai_run_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_qmx_mopa" << " M=" << TileSizeM << " N=" << TileSizeN << " k_chunk_count=" << (d_kh * d_kw) << " k_chunk_length=" << ci);
-                                    kai_run_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_qmx_mopa(
-                                        TileSizeM, TileSizeN, d_kh * d_kw, ci, ATile, BTile, CTile, co * sizeof(float),
-                                        -std::numeric_limits<float>::max(), std::numeric_limits<float>::max()
-                                    );
-                                }
-                                else {
-                                    KLEIDIAI_KERNEL_LOG("kai_run_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa" << " M=" << TileSizeM << " N=" << TileSizeN << " k_chunk_count=" << (d_kh * d_kw) << " k_chunk_length=" << ci);
-                                    kai_run_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa(
-                                        TileSizeM, TileSizeN, d_kh * d_kw, ci, ATile, BTile, CTile, co * sizeof(float),
-                                        -std::numeric_limits<float>::max(), std::numeric_limits<float>::max()
-                                    );
-                                }
-                            #else
-                                KLEIDIAI_KERNEL_LOG("kai_run_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa" << " M=" << TileSizeM << " N=" << TileSizeN << " k_chunk_count=" << (d_kh * d_kw) << " k_chunk_length=" << ci);
-	    if (use_1vl_kai){
-                                kai_run_imatmul_clamp_f32_f32p1vlx1_f32p1vlx1b_1vlx1vl_sme_mopa(
-                                    TileSizeM, TileSizeN, d_kh * d_kw, ci, ATile, BTile, CTile, co * sizeof(float),
-                                    -std::numeric_limits<float>::max(), std::numeric_limits<float>::max()
-                                );
-	    }else {
-                                kai_run_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa(
-                                    TileSizeM, TileSizeN, d_kh * d_kw, ci, ATile, BTile, CTile, co * sizeof(float),
-                                    -std::numeric_limits<float>::max(), std::numeric_limits<float>::max()
-                                );
-	    }
-                            #endif // ENABLE_QMX_KERNELS
-                }
+                KLEIDIAI_KERNEL_LOG("kai_run_imatmul_clamp" << " M=" << TileSizeM << " N=" << TileSizeN << " k_chunk_count=" << (d_kh * d_kw) << " k_chunk_length=" << ci);
+                kai_funcs->run_matmul(
+                    TileSizeM, TileSizeN, d_kh * d_kw, ci,
+                    reinterpret_cast<const void*>(ATile),
+                    BTile,
+                    CTile,
+                    co * sizeof(float),
+                    -std::numeric_limits<float>::max(), std::numeric_limits<float>::max()
+                );
 	    }
         });
 
@@ -795,6 +757,41 @@ ArmKleidiAI::MlasConvPrepare(MLAS_CONV_PARAMETERS* Parameters,
         return false;
     }
 
+    // Calculate dimensions for performance check
+    const auto d_kh = ComputeKernelSize(Parameters->DilationShape[0], Parameters->KernelShape[0]);
+    const auto d_kw = ComputeKernelSize(Parameters->DilationShape[1], Parameters->KernelShape[1]);
+    const auto m = ComputeConvOutSize(Parameters->InputShape[0], d_kh, Parameters->Padding[0], Parameters->StrideShape[0]) *
+                   ComputeConvOutSize(Parameters->InputShape[1], d_kw, Parameters->Padding[1], Parameters->StrideShape[1]);
+
+    size_t M = m;
+    size_t N = Parameters->FilterCount;
+    size_t K_matmul = Parameters->InputChannels * d_kh * d_kw;
+
+    // Get step sizes for 2vl variant (typical case)
+    size_t n_step_2vl = ArmKleidiAI::UseSME2 ? kai_get_n_step_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme2_mopa()
+                                             : kai_get_n_step_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa();
+    size_t m_step_2vl = ArmKleidiAI::UseSME2 ? kai_get_m_step_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme2_mopa()
+                                             : kai_get_m_step_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa();
+
+    // Check if we would use 1vl variant
+    bool use_1vl = (m < m_step_2vl) || (Parameters->FilterCount % n_step_2vl != 0);
+
+    size_t m_step, n_step;
+    if (use_1vl) {
+        m_step = ArmKleidiAI::UseSME2 ? kai_get_m_step_imatmul_clamp_f32_f32p1vlx1_f32p1vlx1b_1vlx1vl_sme2_mopa()
+                                      : kai_get_m_step_imatmul_clamp_f32_f32p1vlx1_f32p1vlx1b_1vlx1vl_sme_mopa();
+        n_step = ArmKleidiAI::UseSME2 ? kai_get_n_step_imatmul_clamp_f32_f32p1vlx1_f32p1vlx1b_1vlx1vl_sme2_mopa()
+                                      : kai_get_n_step_imatmul_clamp_f32_f32p1vlx1_f32p1vlx1b_1vlx1vl_sme_mopa();
+    } else {
+        m_step = m_step_2vl;
+        n_step = n_step_2vl;
+    }
+
+    // Perform performance check
+    if (!CheckKleidiAIPerformance(M, N, K_matmul, m_step, n_step)) {
+        return false;
+    }
+
     //Allocate an aligned buffer for MlasTranspose()
     *WorkingBufferSize = ComputeMlasWorkingBufferSize(Parameters->FilterCount,
                                                       Parameters->InputShape[0], Parameters->InputShape[1],
@@ -821,6 +818,93 @@ ArmKleidiAI::MlasConv(
         // Fallback to Default Mlas
         return false;
     };
+
+    // Calculate dimensions to determine which kernel variant to use
+    const auto d_kh = ComputeKernelSize(Parameters->DilationShape[0], Parameters->KernelShape[0]);
+    const auto d_kw = ComputeKernelSize(Parameters->DilationShape[1], Parameters->KernelShape[1]);
+    const auto m = ComputeConvOutSize(Parameters->InputShape[0], d_kh, Parameters->Padding[0], Parameters->StrideShape[0]) *
+                   ComputeConvOutSize(Parameters->InputShape[1], d_kw, Parameters->Padding[1], Parameters->StrideShape[1]);
+
+    // Get 2vl step sizes to check if we need 1vl variant
+    size_t n_step_2vl = ArmKleidiAI::UseSME2 ? kai_get_n_step_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme2_mopa()
+                                             : kai_get_n_step_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa();
+    size_t m_step_2vl = ArmKleidiAI::UseSME2 ? kai_get_m_step_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme2_mopa()
+                                             : kai_get_m_step_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa();
+
+    // Determine which variant to use based on matrix dimensions
+    bool use_1vl = (m < m_step_2vl) || (Parameters->FilterCount%n_step_2vl != 0);
+
+    // Use thread_local static to ensure stable addresses for cache keys
+    static thread_local KaiKernelFunctions kai_funcs_1vl_local;
+    static thread_local KaiKernelFunctions kai_funcs_2vl_local;
+
+    // Initialize function pointers once per thread
+    if (!kai_funcs_1vl_local.get_m_step) {
+        // Initialize 1vl variant
+        if (ArmKleidiAI::UseSME2) {
+            kai_funcs_1vl_local.get_m_step = kai_get_m_step_imatmul_clamp_f32_f32p1vlx1_f32p1vlx1b_1vlx1vl_sme2_mopa;
+            kai_funcs_1vl_local.get_n_step = kai_get_n_step_imatmul_clamp_f32_f32p1vlx1_f32p1vlx1b_1vlx1vl_sme2_mopa;
+            kai_funcs_1vl_local.get_rhs_packed_offset = kai_get_rhs_packed_offset_imatmul_clamp_f32_f32p1vlx1_f32p1vlx1b_1vlx1vl_sme2_mopa;
+            kai_funcs_1vl_local.run_matmul = kai_run_imatmul_clamp_f32_f32p1vlx1_f32p1vlx1b_1vlx1vl_sme2_mopa;
+        } else {
+            kai_funcs_1vl_local.get_m_step = kai_get_m_step_imatmul_clamp_f32_f32p1vlx1_f32p1vlx1b_1vlx1vl_sme_mopa;
+            kai_funcs_1vl_local.get_n_step = kai_get_n_step_imatmul_clamp_f32_f32p1vlx1_f32p1vlx1b_1vlx1vl_sme_mopa;
+            kai_funcs_1vl_local.get_rhs_packed_offset = kai_get_rhs_packed_offset_imatmul_clamp_f32_f32p1vlx1_f32p1vlx1b_1vlx1vl_sme_mopa;
+            kai_funcs_1vl_local.run_matmul = kai_run_imatmul_clamp_f32_f32p1vlx1_f32p1vlx1b_1vlx1vl_sme_mopa;
+        }
+        kai_funcs_1vl_local.get_rhs_packed_size = kai_get_rhs_packed_size_rhs_imatmul_pack_kxn_x32p1vlx1b_x32_x32_sme;
+        kai_funcs_1vl_local.run_rhs_pack = kai_run_rhs_imatmul_pack_kxn_x32p1vlx1b_x32_x32_sme;
+        kai_funcs_1vl_local.get_lhs_packed_size = kai_get_lhs_packed_size_lhs_imatmul_pack_x32p1vlx1_x32p_sme;
+        kai_funcs_1vl_local.run_lhs_pack = kai_run_lhs_imatmul_pack_x32p1vlx1_x32p_sme;
+
+        // Initialize 2vl variant
+        if (ArmKleidiAI::UseSME2) {
+            kai_funcs_2vl_local.get_m_step = kai_get_m_step_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme2_mopa;
+            kai_funcs_2vl_local.get_n_step = kai_get_n_step_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme2_mopa;
+            kai_funcs_2vl_local.get_rhs_packed_offset = kai_get_rhs_packed_offset_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme2_mopa;
+            kai_funcs_2vl_local.run_matmul = kai_run_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme2_mopa;
+        } else {
+#if defined(ENABLE_QMX_KERNELS)
+            if (ArmKleidiAI::vendor_name.compare("Qualcomm") == 0) {
+                kai_funcs_2vl_local.get_m_step = kai_get_m_step_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_qmx_mopa;
+                kai_funcs_2vl_local.get_n_step = kai_get_n_step_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_qmx_mopa;
+                kai_funcs_2vl_local.get_rhs_packed_offset = kai_get_rhs_packed_offset_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_qmx_mopa;
+                kai_funcs_2vl_local.run_matmul = kai_run_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_qmx_mopa;
+            } else {
+                kai_funcs_2vl_local.get_m_step = kai_get_m_step_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa;
+                kai_funcs_2vl_local.get_n_step = kai_get_n_step_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa;
+                kai_funcs_2vl_local.get_rhs_packed_offset = kai_get_rhs_packed_offset_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa;
+                kai_funcs_2vl_local.run_matmul = kai_run_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa;
+            }
+#else
+            kai_funcs_2vl_local.get_m_step = kai_get_m_step_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa;
+            kai_funcs_2vl_local.get_n_step = kai_get_n_step_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa;
+            kai_funcs_2vl_local.get_rhs_packed_offset = kai_get_rhs_packed_offset_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa;
+            kai_funcs_2vl_local.run_matmul = kai_run_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa;
+#endif
+        }
+        kai_funcs_2vl_local.get_rhs_packed_size = kai_get_rhs_packed_size_rhs_imatmul_pack_kxn_x32p2vlx1b_x32_x32_sme;
+        kai_funcs_2vl_local.run_rhs_pack = kai_run_rhs_imatmul_pack_kxn_x32p2vlx1b_x32_x32_sme;
+        kai_funcs_2vl_local.get_lhs_packed_size = kai_get_lhs_packed_size_lhs_imatmul_pack_x32p2vlx1_x32p_sme;
+        kai_funcs_2vl_local.run_lhs_pack = kai_run_lhs_imatmul_pack_x32p2vlx1_x32p_sme;
+    }
+
+    // Select the appropriate variant
+    const KaiKernelFunctions* kai_funcs = use_1vl ? &kai_funcs_1vl_local : &kai_funcs_2vl_local;
+
+    // Calculate matrix dimensions
+    size_t M = m;
+    size_t N = Parameters->FilterCount;
+    size_t K = Parameters->InputChannels * d_kh * d_kw;
+
+    // Get tile step sizes
+    size_t m_step = kai_funcs->get_m_step();
+    size_t n_step = kai_funcs->get_n_step();
+
+    // Perform performance check
+    if (!CheckKleidiAIPerformance(M, N, K, m_step, n_step)) {
+        return false;
+    }
     ConvolveSme(Parameters->FilterCount, Parameters->InputChannels,          // channel out, in
                 Parameters->InputShape[0], Parameters->InputShape[1],         // image dimensions
                 Parameters->KernelShape[0], Parameters->KernelShape[1],      // kernel dimensions
@@ -828,9 +912,12 @@ ArmKleidiAI::MlasConv(
                 Parameters->DilationShape[0], Parameters->DilationShape[1],  // kernel dilation
                 Parameters->Padding[0],                                      // image padding
                 Parameters->GroupCount,                                      // filter groups
-                Filter, Bias, Input, Output, WorkingBuffer, ThreadPool);
+                Filter, Bias, Input, Output, WorkingBuffer,
+                kai_funcs,
+                ThreadPool);
 
     MlasActivation(Parameters->Activation, Output, nullptr, Parameters->FilterCount, Parameters->OutputSize,
                    Parameters->OutputSize);
+
     return true;
 }
